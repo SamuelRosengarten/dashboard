@@ -1117,6 +1117,87 @@ router.patch("/main-resume/", async (req, res): Promise<void> => {
     }
 });
 
+// Plain string fields a student may edit, with a max length for each.
+const EDITABLE_STRING_FIELDS: Record<string, number> = {
+    firstName: 100,
+    lastName: 100,
+    phone: 30,
+    location: 200,
+    school: 200,
+    program: 200,
+    graduationYear: 10,
+    linkedinUrl: 300,
+    portfolioUrl: 300,
+    devpostUsername: 50,
+    githubUsername: 50,
+};
+
+// Fields validated by their own sanitizer further down the /update handler.
+const EDITABLE_STRUCTURED_FIELDS = [
+    "experiences",
+    "education",
+    "projects",
+    "skillsStructured",
+    "workAuthorization",
+    "preferredLanguage",
+    "onboardingState",
+];
+
+// Written by the GitHub / Devpost routes. A client may only clear them (null).
+const CLEARABLE_ONLY_FIELDS = ["github", "devpost"];
+
+/**
+ * Reduces a PATCH /update body to the fields a student is allowed to change.
+ * Anything else (email, id, resume, profileScore, ...) is dropped silently,
+ * because the account page re-sends the whole profile object on every save.
+ */
+function pickEditableProfileFields(
+    body: unknown
+): { value: Record<string, any>; error?: undefined } | { error: string } {
+    if (typeof body !== "object" || body === null || Array.isArray(body)) {
+        return { error: "Request body must be an object" };
+    }
+    const input = body as Record<string, any>;
+    const picked: Record<string, any> = {};
+
+    for (const [field, maxLength] of Object.entries(EDITABLE_STRING_FIELDS)) {
+        const value = input[field];
+        if (value === undefined) continue;
+        if (value !== null && typeof value !== "string") {
+            return { error: `${field} must be a string` };
+        }
+        if (typeof value === "string" && value.length > maxLength) {
+            return {
+                error: `${field} must be at most ${maxLength} characters`,
+            };
+        }
+        picked[field] = value;
+    }
+
+    if (input.skills !== undefined) {
+        const skills = input.skills;
+        if (
+            skills !== null &&
+            (!Array.isArray(skills) ||
+                skills.length > 100 ||
+                skills.some((s) => typeof s !== "string" || s.length > 100))
+        ) {
+            return { error: "skills must be an array of short strings" };
+        }
+        picked.skills = skills;
+    }
+
+    for (const field of EDITABLE_STRUCTURED_FIELDS) {
+        if (input[field] !== undefined) picked[field] = input[field];
+    }
+
+    for (const field of CLEARABLE_ONLY_FIELDS) {
+        if (input[field] === null) picked[field] = null;
+    }
+
+    return { value: picked };
+}
+
 router.patch("/update", async (req, res) => {
     const userId = req.user?.uid;
     if (!userId) {
@@ -1124,7 +1205,14 @@ router.patch("/update", async (req, res) => {
     }
 
     try {
-        const updates = req.body;
+        const picked = pickEditableProfileFields(req.body);
+        if (picked.error !== undefined) {
+            return res.status(400).json({
+                error: "Validation error",
+                message: picked.error,
+            });
+        }
+        const updates = picked.value;
 
         // Check if the profile document exists and if email is set
         const profileDoc = await db.collection("profiles").doc(userId).get();
@@ -1256,6 +1344,28 @@ router.patch("/update", async (req, res) => {
                         error: "Validation error",
                         message:
                             "LinkedIn URL must be in format: https://linkedin.com/in/username",
+                    });
+                }
+            }
+        }
+
+        // Validation: Portfolio URL (optional, but if provided must be http(s))
+        if (updates.portfolioUrl && typeof updates.portfolioUrl === "string") {
+            const trimmedUrl = updates.portfolioUrl.trim();
+            if (trimmedUrl !== "") {
+                let validPortfolioUrl = false;
+                try {
+                    validPortfolioUrl = /^https?:$/.test(
+                        new URL(trimmedUrl).protocol
+                    );
+                } catch {
+                    validPortfolioUrl = false;
+                }
+                if (!validPortfolioUrl) {
+                    return res.status(400).json({
+                        error: "Validation error",
+                        message:
+                            "Portfolio URL must start with http:// or https://",
                     });
                 }
             }
