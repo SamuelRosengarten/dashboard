@@ -302,6 +302,38 @@ type SanitizeResult<T> =
 const trimmedString = (value: unknown): string =>
     typeof value === "string" ? value.trim() : "";
 
+// Letters from any alphabet (accents included), spaces, hyphens, apostrophes
+// and periods, e.g. "Hélène", "Jean-Luc", "O'Brien".
+const PERSON_NAME_REGEX = /^[\p{L}\p{M}][\p{L}\p{M}\s'’.-]*$/u;
+
+// Keeps letters (accents included) and spaces; drops the rest.
+const sanitizeDocumentName = (fileName: string, fallback: string): string => {
+    const base = fileName.replace(/\.[^/.]+$/, "");
+    return base.replace(/[^\p{L}\p{M}\s]/gu, "").trim() || fallback;
+};
+
+// A PDF starts with "%PDF-" (the spec allows it within the first 1024 bytes).
+// The mime type sent by the browser is only a claim, so check the content.
+const looksLikePdf = (buffer: Buffer): boolean =>
+    buffer.subarray(0, 1024).includes("%PDF-");
+
+// Removes the files an upload replaced, once the new one is safely saved.
+// A failed cleanup is logged but never fails the request.
+async function deleteReplacedFiles(
+    files: { name: string; delete: () => Promise<unknown> }[],
+    keepPath: string
+): Promise<void> {
+    const stale = files.filter((f) => f.name !== keepPath);
+    const results = await Promise.allSettled(stale.map((f) => f.delete()));
+    results.forEach((result, i) => {
+        if (result.status === "rejected") {
+            logger.warn(`Could not delete old file ${stale[i].name}`, {
+                reason: String(result.reason),
+            });
+        }
+    });
+}
+
 const optionalTrimmed = (value: unknown): string | undefined => {
     if (typeof value !== "string") return undefined;
     const trimmed = value.trim();
@@ -993,26 +1025,27 @@ router.patch("/main-resume/", async (req, res): Promise<void> => {
                     return;
                 }
 
+                if (!looksLikePdf(fileBuffer)) {
+                    responseHandled = true;
+                    res.status(400).json({
+                        error: "File is not a valid PDF",
+                    });
+                    return;
+                }
+
                 logger.info(
                     `Processing file: ${fileName}, size: ${fileBuffer.length} bytes`
                 );
 
                 // Sanitize file name (letters & spaces only)
-                let originalName = fileName.replace(/\.[^/.]+$/, ""); // remove extension
-                originalName = originalName.replace(/[^a-zA-Z\s]/g, "").trim(); // keep only letters and spaces
-                if (!originalName) originalName = "Resume";
+                const originalName = sanitizeDocumentName(fileName, "Resume");
 
-                // Delete any existing resumes in this folder
+                // Remember the current resume(s); they are deleted only after
+                // the new one is saved, so a failed upload loses nothing.
                 const folderPath = `profiles/${userId}/resumes/main_resume/`;
                 const [existingFiles] = await storage.bucket().getFiles({
                     prefix: folderPath,
                 });
-                if (existingFiles.length > 0) {
-                    await Promise.all(existingFiles.map((f) => f.delete()));
-                    logger.info(
-                        `Deleted ${existingFiles.length} old resume file(s) for user ${userId}`
-                    );
-                }
 
                 // Generate a unique resume ID
                 const resumeId = crypto.randomBytes(16).toString("hex");
@@ -1057,6 +1090,8 @@ router.patch("/main-resume/", async (req, res): Promise<void> => {
                     );
 
                 logger.info(`Resume metadata saved for user ${userId}`);
+
+                await deleteReplacedFiles(existingFiles, filePath);
 
                 responseHandled = true;
                 res.status(200).json({
@@ -1251,11 +1286,11 @@ router.patch("/update", async (req, res) => {
                     message: "First name is required",
                 });
             }
-            const nameRegex = /^[a-zA-Z\s]+$/;
-            if (!nameRegex.test(trimmedFirstName)) {
+            if (!PERSON_NAME_REGEX.test(trimmedFirstName)) {
                 return res.status(400).json({
                     error: "Validation error",
-                    message: "First name can only contain letters and spaces",
+                    message:
+                        "First name can only contain letters, spaces, hyphens, and apostrophes",
                 });
             }
         }
@@ -1275,11 +1310,11 @@ router.patch("/update", async (req, res) => {
                     message: "Last name is required",
                 });
             }
-            const nameRegex = /^[a-zA-Z\s]+$/;
-            if (!nameRegex.test(trimmedLastName)) {
+            if (!PERSON_NAME_REGEX.test(trimmedLastName)) {
                 return res.status(400).json({
                     error: "Validation error",
-                    message: "Last name can only contain letters and spaces",
+                    message:
+                        "Last name can only contain letters, spaces, hyphens, and apostrophes",
                 });
             }
         }
@@ -1823,18 +1858,24 @@ router.patch("/cover-letter/", async (req, res): Promise<void> => {
                     return;
                 }
 
-                let originalName = fileName.replace(/\.[^/.]+$/, "");
-                originalName = originalName.replace(/[^a-zA-Z\s]/g, "").trim();
-                if (!originalName) originalName = "Cover Letter";
+                if (!looksLikePdf(fileBuffer)) {
+                    responseHandled = true;
+                    res.status(400).json({
+                        error: "File is not a valid PDF",
+                    });
+                    return;
+                }
 
-                // Delete any existing cover letters in this folder
+                const originalName = sanitizeDocumentName(
+                    fileName,
+                    "Cover Letter"
+                );
+
+                // Deleted only after the new file is saved (see resume upload).
                 const folderPath = `profiles/${userId}/documents/cover_letters/`;
                 const [existingFiles] = await storage.bucket().getFiles({
                     prefix: folderPath,
                 });
-                if (existingFiles.length > 0) {
-                    await Promise.all(existingFiles.map((f) => f.delete()));
-                }
 
                 const coverId = crypto.randomBytes(16).toString("hex");
                 const filePath = `profiles/${userId}/documents/cover_letters/${coverId}.pdf`;
@@ -1872,6 +1913,8 @@ router.patch("/cover-letter/", async (req, res): Promise<void> => {
                     );
 
                 logger.info(`Cover letter saved for user ${userId}`);
+
+                await deleteReplacedFiles(existingFiles, filePath);
 
                 responseHandled = true;
                 res.status(200).json({
@@ -2095,18 +2138,21 @@ router.patch("/grades/", async (req, res): Promise<void> => {
                     return;
                 }
 
-                let originalName = fileName.replace(/\.[^/.]+$/, "");
-                originalName = originalName.replace(/[^a-zA-Z\s]/g, "").trim();
-                if (!originalName) originalName = "Grades";
+                if (!looksLikePdf(fileBuffer)) {
+                    responseHandled = true;
+                    res.status(400).json({
+                        error: "File is not a valid PDF",
+                    });
+                    return;
+                }
 
-                // Delete any existing grades documents in this folder
+                const originalName = sanitizeDocumentName(fileName, "Grades");
+
+                // Deleted only after the new file is saved (see resume upload).
                 const folderPath = `profiles/${userId}/documents/grades/`;
                 const [existingFiles] = await storage.bucket().getFiles({
                     prefix: folderPath,
                 });
-                if (existingFiles.length > 0) {
-                    await Promise.all(existingFiles.map((f) => f.delete()));
-                }
 
                 const gradesId = crypto.randomBytes(16).toString("hex");
                 const filePath = `profiles/${userId}/documents/grades/${gradesId}.pdf`;
@@ -2149,6 +2195,8 @@ router.patch("/grades/", async (req, res): Promise<void> => {
                     );
 
                 logger.info(`Grades document saved for user ${userId}`);
+
+                await deleteReplacedFiles(existingFiles, filePath);
 
                 responseHandled = true;
                 res.status(200).json({
