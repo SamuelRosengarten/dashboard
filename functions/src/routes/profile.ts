@@ -1181,6 +1181,29 @@ const EDITABLE_STRUCTURED_FIELDS = [
 // Written by the GitHub / Devpost routes. A client may only clear them (null).
 const CLEARABLE_ONLY_FIELDS = ["github", "devpost"];
 
+/** Returns an error message, or undefined when the string field is valid. */
+function validateStringField(
+    field: string,
+    value: unknown,
+    maxLength: number
+): string | undefined {
+    if (value === null) return undefined;
+    if (typeof value !== "string") return `${field} must be a string`;
+    if (value.length > maxLength) {
+        return `${field} must be at most ${maxLength} characters`;
+    }
+    return undefined;
+}
+
+function isValidSkills(skills: unknown): boolean {
+    if (skills === null) return true;
+    return (
+        Array.isArray(skills) &&
+        skills.length <= 100 &&
+        skills.every((s) => typeof s === "string" && s.length <= 100)
+    );
+}
+
 /**
  * Reduces a PATCH /update body to the fields a student is allowed to change.
  * Anything else (email, id, resume, profileScore, ...) is dropped silently,
@@ -1198,28 +1221,16 @@ function pickEditableProfileFields(
     for (const [field, maxLength] of Object.entries(EDITABLE_STRING_FIELDS)) {
         const value = input[field];
         if (value === undefined) continue;
-        if (value !== null && typeof value !== "string") {
-            return { error: `${field} must be a string` };
-        }
-        if (typeof value === "string" && value.length > maxLength) {
-            return {
-                error: `${field} must be at most ${maxLength} characters`,
-            };
-        }
+        const error = validateStringField(field, value, maxLength);
+        if (error) return { error };
         picked[field] = value;
     }
 
     if (input.skills !== undefined) {
-        const skills = input.skills;
-        if (
-            skills !== null &&
-            (!Array.isArray(skills) ||
-                skills.length > 100 ||
-                skills.some((s) => typeof s !== "string" || s.length > 100))
-        ) {
+        if (!isValidSkills(input.skills)) {
             return { error: "skills must be an array of short strings" };
         }
-        picked.skills = skills;
+        picked.skills = input.skills;
     }
 
     for (const field of EDITABLE_STRUCTURED_FIELDS) {
